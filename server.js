@@ -3,11 +3,26 @@ const admin = require('firebase-admin');
 const cors = require('cors');
 require('dotenv').config();
 
-// Inicializa o Firebase Admin usando as variáveis de ambiente ou arquivo local
-// (Mais tarde configuraremos o JSON de credenciais no Render)
-admin.initializeApp({
-  credential: admin.credential.applicationDefault()
-});
+// Inicialização segura do Firebase Admin
+try {
+  let credential;
+  if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+    const serviceAccountContent = process.env.FIREBASE_SERVICE_ACCOUNT.trim();
+    // Verifica se está a vir como string JSON e converte para objeto
+    const serviceAccount = typeof serviceAccountContent === 'string' 
+      ? JSON.parse(serviceAccountContent) 
+      : serviceAccountContent;
+      
+    credential = admin.credential.cert(serviceAccount);
+  } else {
+    credential = admin.credential.applicationDefault();
+  }
+
+  admin.initializeApp({ credential });
+  console.log('Firebase Admin inicializado com sucesso.');
+} catch (error) {
+  console.error('Erro crítico ao inicializar o Firebase Admin:', error.message);
+}
 
 const db = admin.firestore();
 const app = express();
@@ -95,7 +110,6 @@ app.post('/webhook', async (req, res) => {
       const pagamentoDoc = await pagamentoRef.get();
 
       if (pagamentoDoc.exists) {
-        // Pagamento já processado anteriormente, retorna 200 para o MP parar de enviar
         return res.status(200).send('Pagamento já processado');
       }
 
@@ -124,7 +138,6 @@ app.post('/webhook', async (req, res) => {
     return res.status(200).send('Webhook recebido com sucesso');
   } catch (error) {
     console.error('Erro no webhook:', error);
-    // Retorna 500 para o Mercado Pago tentar reenviar se houver falha de servidor
     return res.status(500).send('Erro interno');
   }
 });
