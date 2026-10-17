@@ -142,6 +142,62 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
+// 3. ROTA DA INTELIGÊNCIA TÁTICA (OPENAI)
+app.post('/api/chat', async (req, res) => {
+  try {
+    const { token, messages } = req.body;
+
+    // Validação do Token
+    if (!token) {
+      return res.status(401).json({ error: 'Token de autenticação não fornecido. Acesso negado.' });
+    }
+
+    // Verifica no Firebase se o token é de um utilizador autêntico
+    await admin.auth().verifyIdToken(token);
+
+    // Constrói a regra militar restrita
+    const systemPrompt = {
+      role: 'system',
+      content: 'Você é o assistente virtual oficial do aplicativo BiZu Máximo, voltado para o público militar. Sua missão exclusiva é responder dúvidas estritamente relacionadas a assuntos militares, regulamentos, história das Forças Armadas e preparação física voltada para o TAF, TFM, suplementação e nutrição. Se o utilizador fizer perguntas fora desse escopo, recuse educadamente.'
+    };
+
+    const fullMessages = [systemPrompt, ...(messages || [])];
+
+    // Chamada à API da OpenAI utilizando fetch nativo
+    const openAiResponse = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: 'gpt-4o-mini',
+        messages: fullMessages,
+        temperature: 0.7
+      })
+    });
+
+    const openAiData = await openAiResponse.json();
+
+    if (!openAiResponse.ok) {
+      console.error('Erro retornado pela OpenAI:', openAiData);
+      // Se a chave for inválida ou limite for atingido, retorna 503/504 para o Flutter tratar
+      return res.status(503).json({ error: 'Serviço de IA indisponível no momento.' });
+    }
+
+    const reply = openAiData.choices[0].message.content;
+    return res.status(200).json({ reply });
+
+  } catch (error) {
+    console.error('Erro no Assistente IA:', error);
+    // Trata especificamente o caso do token do Firebase expirar
+    if (error.code && error.code.startsWith('auth/')) {
+      return res.status(401).json({ error: 'Sessão expirada. Por favor, faça login novamente.' });
+    }
+    return res.status(500).json({ error: 'Erro interno no servidor tático.' });
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Servidor rodando na porta ${PORT}`);
