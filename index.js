@@ -340,12 +340,27 @@ app.post('/gerar-pix', async (req, res) => {
     const data = await mpResponse.json();
     if (!mpResponse.ok) {
       console.error('Mercado Pago recusou a criação do Pix:', data);
-      return res.status(502).json({ error: 'Não foi possível gerar o Pix.' });
+      const providerCode = Array.isArray(data.cause)
+        ? data.cause.map((cause) => cause?.code).filter(Boolean).join(', ')
+        : undefined;
+      return res.status(502).json({
+        error: 'O Mercado Pago recusou a criação do PIX.',
+        ...(providerCode ? { providerCode } : {}),
+      });
     }
 
     const pix = data.point_of_interaction?.transaction_data;
     if (!pix?.qr_code) {
-      return res.status(502).json({ error: 'Resposta inesperada do Mercado Pago.' });
+      console.error('Mercado Pago criou resposta sem dados PIX:', {
+        paymentId: data.id,
+        status: data.status,
+        statusDetail: data.status_detail,
+      });
+      return res.status(502).json({
+        error: 'O Mercado Pago não retornou o código PIX.',
+        paymentStatus: data.status || 'desconhecido',
+        paymentStatusDetail: data.status_detail || 'sem_detalhe',
+      });
     }
 
     return res.status(200).json({
