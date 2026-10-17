@@ -158,7 +158,17 @@ app.post('/api/chat', async (req, res) => {
 
     const result = await aiResponse.json();
     if (!aiResponse.ok) {
-      console.error('Provedor de IA recusou a solicitação:', aiResponse.status, result.error?.type);
+      const providerError = result?.error || {};
+      console.error('Provedor de IA recusou a solicitação:', JSON.stringify({
+        status: aiResponse.status,
+        type: providerError.type || null,
+        code: providerError.code || null,
+        param: providerError.param || null,
+        message: typeof providerError.message === 'string'
+          ? providerError.message.slice(0, 500)
+          : null,
+        requestId: aiResponse.headers.get('x-request-id'),
+      }));
       return res.status(aiResponse.status === 429 ? 429 : 502)
         .json({ error: 'Não foi possível gerar a resposta agora.' });
     }
@@ -275,6 +285,8 @@ app.get('/assinatura/status', async (req, res) => {
       ai_expiry_date: aiExpiry?.toISOString() || null,
       elite_active: acessoEliteAtivo(state, userData, now),
       ai_active: acessoIaAtivo(state, now),
+      elite_plan_id: state.elite_plan_id || null,
+      ai_plan_id: state.ai_plan_id || null,
       contrato_aceite: state.contrato_aceite === true,
       contrato_versao: state.contrato_versao || CONTRACT_VERSION,
     });
@@ -559,6 +571,9 @@ app.post('/webhook', async (req, res) => {
       tx.set(stateRef, {
         ...dadosAssinatura,
         [campo]: admin.firestore.Timestamp.fromDate(novaValidade),
+        ...(produto.isElite
+          ? { elite_plan_id: productId }
+          : { ai_plan_id: productId }),
         atualizadoEm: admin.firestore.FieldValue.serverTimestamp(),
       }, { merge: true });
 
@@ -927,12 +942,12 @@ function criarFrotaNaval() {
       const horizontal = crypto.randomInt(2) === 0;
       const row = crypto.randomInt(horizontal ? 10 : 11 - ship.size);
       const col = crypto.randomInt(horizontal ? 11 - ship.size : 10);
-      const cells = Array.from({ length: ship.size }, (_, index) => [
-        row + (horizontal ? 0 : index),
-        col + (horizontal ? index : 0),
-      ]);
-      if (cells.some(([r, c]) => occupied.has(`${r}:${c}`))) continue;
-      cells.forEach(([r, c]) => occupied.add(`${r}:${c}`));
+      const cells = Array.from({ length: ship.size }, (_, index) => ({
+        row: row + (horizontal ? 0 : index),
+        col: col + (horizontal ? index : 0),
+      }));
+      if (cells.some(({ row: r, col: c }) => occupied.has(`${r}:${c}`))) continue;
+      cells.forEach(({ row: r, col: c }) => occupied.add(`${r}:${c}`));
       return { ...ship, cells };
     }
     throw new Error('Não foi possível posicionar a frota.');
@@ -1116,7 +1131,9 @@ app.post('/jogos/batalha-naval/:code/tiro', async (req, res) => {
       const privateRef = roomRef.collection('private').doc(targetUid);
       const privateSnapshot = await tx.get(privateRef);
       const fleet = privateSnapshot.data()?.fleet || [];
-      const ship = fleet.find((item) => item.cells.some((cell) => cell[0] === row && cell[1] === col));
+      const ship = fleet.find((item) => item.cells.some((cell) =>
+        (Array.isArray(cell) ? cell[0] : cell.row) === row &&
+        (Array.isArray(cell) ? cell[1] : cell.col) === col));
       const shots = [...room.shots];
       const action = {
         actionId,
@@ -1132,11 +1149,19 @@ app.post('/jogos/batalha-naval/:code/tiro', async (req, res) => {
       const hits = new Set(shots
         .filter((shot) => shot.targetUid === targetUid && shot.hit)
         .map((shot) => `${shot.row}:${shot.col}`));
-      if (ship && ship.cells.every((cell) => hits.has(`${cell[0]}:${cell[1]}`))) {
+      if (ship && ship.cells.every((cell) => {
+        const cellRow = Array.isArray(cell) ? cell[0] : cell.row;
+        const cellCol = Array.isArray(cell) ? cell[1] : cell.col;
+        return hits.has(`${cellRow}:${cellCol}`);
+      })) {
         action.sunkShip = ship.name;
       }
       const victory = fleet.every((item) =>
-        item.cells.every((cell) => hits.has(`${cell[0]}:${cell[1]}`)));
+        item.cells.every((cell) => {
+          const cellRow = Array.isArray(cell) ? cell[0] : cell.row;
+          const cellCol = Array.isArray(cell) ? cell[1] : cell.col;
+          return hits.has(`${cellRow}:${cellCol}`);
+        }));
       const status = victory ? 'finished' : 'battle';
       const updated = {
         shots,
