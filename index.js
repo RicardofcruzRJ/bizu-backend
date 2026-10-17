@@ -478,5 +478,625 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
+// ---------------------------------------------------------------------
+// RANKING TÁTICO GLOBAL — projeção pública mínima e scores server-side.
+// O cliente envia apenas o tipo da atividade; pontos e métricas vêm do servidor.
+// ---------------------------------------------------------------------
+const rankingPublicRef = (uid) => db.collection('ranking_global').doc(uid);
+const rankingPrivateRef = (uid) => db.collection('ranking_private').doc(uid);
+const rankingEventRef = (uid, eventId) =>
+  db.collection('ranking_eventos').doc(`${uid}_${eventId}`);
+
+function dataLocalRanking(date = new Date()) {
+  const partes = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/Sao_Paulo',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(date);
+  const valor = Object.fromEntries(partes.map((parte) => [parte.type, parte.value]));
+  return `${valor.year}-${valor.month}-${valor.day}`;
+}
+
+function textoPublico(value, fallback, maxLength) {
+  if (typeof value !== 'string' || !value.trim()) return fallback;
+  return value.trim().slice(0, maxLength);
+}
+
+async function dadosPublicosDoRanking(uid, userData, scoreData) {
+  let photoUrl = typeof userData.photo_url === 'string' ? userData.photo_url : '';
+  if (!photoUrl) {
+    try {
+      photoUrl = (await admin.auth().getUser(uid)).photoURL || '';
+      if (photoUrl) {
+        await db.collection('usuarios').doc(uid).set({ photo_url: photoUrl }, { merge: true });
+        userData.photo_url = photoUrl;
+      }
+    } catch (_) {
+      // A foto é opcional; a interface usa as iniciais quando ausente.
+    }
+  }
+  if (userData.participar_ranking !== true) {
+    await rankingPublicRef(uid).delete();
+    return null;
+  }
+
+  const shareProgress = userData.compartilhar_progresso_fisico === true;
+  const entry = {
+    uid,
+    participar_ranking: true,
+    nome_guerra: textoPublico(userData.nomeGuerra, 'Combatente', 40),
+    posto_graduacao: textoPublico(userData.postoGraduacao, 'Não informado', 60),
+    om: textoPublico(userData.om, '', 100),
+    cidade_estado: textoPublico(userData.cidadeEstado, '', 100),
+    photo_url: /^https:\/\//i.test(photoUrl) ? photoUrl.slice(0, 500) : '',
+    score: Number.isFinite(scoreData.score) ? scoreData.score : 0,
+    dias_streak: Number.isFinite(scoreData.dias_streak) ? scoreData.dias_streak : 0,
+    compartilhar_progresso_fisico: shareProgress,
+    atualizado_em: admin.firestore.FieldValue.serverTimestamp(),
+  };
+  if (shareProgress) {
+    entry.progresso_fisico = {
+      treinos_concluidos: Number(scoreData.treinos_concluidos) || 0,
+      distancia_total_metros: Number(scoreData.distancia_total_metros) || 0,
+      ...(scoreData.progresso_fisico || {}),
+    };
+  }
+  await rankingPublicRef(uid).set(entry);
+  return entry;
+}
+
+app.post('/ranking/profile-sync', async (req, res) => {
+  const decoded = await verificarTokenFirebase(req);
+  if (!decoded) return res.status(401).json({ error: 'Sessão inválida.' });
+  if (decoded.firebase?.sign_in_provider === 'anonymous') {
+    return res.status(403).json({ error: 'Entre em uma conta para usar o ranking.' });
+  }
+  try {
+    const uid = decoded.uid;
+    const [userSnapshot, scoreSnapshot] = await Promise.all([
+      db.collection('usuarios').doc(uid).get(),
+      rankingPrivateRef(uid).get(),
+    ]);
+    const entry = await dadosPublicosDoRanking(
+      uid,
+      userSnapshot.data() || {},
+      scoreSnapshot.data() || { score: 0 },
+    );
+    return res.status(200).json({ participates: entry != null });
+  } catch (error) {
+    console.error('Falha ao sincronizar perfil do ranking:', error.message);
+    return res.status(503).json({ error: 'Não foi possível sincronizar o ranking.' });
+  }
+});
+
+app.post('/ranking/activity', async (req, res) => {
+  const decoded = await verificarTokenFirebase(req);
+  if (!decoded) return res.status(401).json({ error: 'Sessão inválida.' });
+  if (decoded.firebase?.sign_in_provider === 'anonymous') {
+    return res.status(403).json({ error: 'Entre em uma conta para pontuar no ranking.' });
+  }
+
+  try {
+    const uid = decoded.uid;
+    const tipo = req.body?.type;
+    const hoje = dataLocalRanking();
+    let eventId;
+    let pontos;
+    let distanciaMetros = 0;
+    let exercicioMetric = null;
+    let exercicioValor = 0;
+    let streak = 0;
+
+    if (tipo === 'daily_checkin') {
+      const userSnapshot = await db.collection('usuarios').doc(uid).get();
+      const userData = userSnapshot.data() || {};
+      const lastCheckin = paraDate(userData.gamificacao?.ultimoCheckIn);
+      if (!lastCheckin || dataLocalRanking(lastCheckin) !== hoje) {
+        return res.status(409).json({ error: 'Check-in diário ainda não registrado.' });
+      }
+      eventId = `checkin_${hoje}`;
+      pontos = 5;
+      streak = Number(userData.gamificacao?.diasStreak) || 0;
+    } else if (tipo === 'taf_run') {
+      const treinoSnapshot = await db.collection('usuarios').doc(uid)
+        .collection('treinos_taf').doc(hoje).get();
+      const run = treinoSnapshot.data()?.metricas?.corrida_metros;
+      distanciaMetros = Number(run?.valor) || 0;
+      if (!treinoSnapshot.exists || distanciaMetros <= 0 || distanciaMetros > 100000) {
+        return res.status(409).json({ error: 'Nenhuma corrida TAF válida foi registrada hoje.' });
+      }
+      eventId = `taf_${hoje}`;
+      pontos = 40 + Math.min(30, Math.floor(distanciaMetros / 1000));
+    } else if (tipo === 'taf_exercise') {
+      const metric = req.body?.metric;
+      const exercisePoints = {
+        flexoes: 20,
+        barra_fixa: 20,
+        abdominais: 20,
+      };
+      if (!Object.prototype.hasOwnProperty.call(exercisePoints, metric)) {
+        return res.status(400).json({ error: 'Métrica de exercício inválida.' });
+      }
+      const treinoSnapshot = await db.collection('usuarios').doc(uid)
+        .collection('treinos_taf').doc(hoje).get();
+      const quantidade = Number(treinoSnapshot.data()?.metricas?.[metric]?.valor) || 0;
+      if (!treinoSnapshot.exists || quantidade <= 0 || quantidade > 10000) {
+        return res.status(409).json({ error: 'Nenhuma métrica válida foi registrada hoje.' });
+      }
+      exercicioMetric = metric;
+      exercicioValor = quantidade;
+      eventId = `taf_exercicio_${metric}_${hoje}`;
+      pontos = exercisePoints[metric];
+    } else if (tipo === 'naval_victory') {
+      // Limite de uma recompensa diária evita chamadas repetidas pelo cliente.
+      eventId = `naval_${hoje}`;
+      pontos = 25;
+    } else {
+      return res.status(400).json({ error: 'Atividade de ranking desconhecida.' });
+    }
+
+    const userRef = db.collection('usuarios').doc(uid);
+    const privateRef = rankingPrivateRef(uid);
+    const eventRef = rankingEventRef(uid, eventId);
+    let awarded = false;
+    await db.runTransaction(async (transaction) => {
+      const [eventSnapshot, scoreSnapshot, userSnapshot] = await Promise.all([
+        transaction.get(eventRef),
+        transaction.get(privateRef),
+        transaction.get(userRef),
+      ]);
+      if (eventSnapshot.exists) return;
+
+      const oldScore = scoreSnapshot.data() || {};
+      const userData = userSnapshot.data() || {};
+      const nextScore = (Number(oldScore.score) || 0) + pontos;
+      const updates = {
+        score: nextScore,
+        atualizado_em: admin.firestore.FieldValue.serverTimestamp(),
+      };
+      if (tipo === 'daily_checkin') updates.dias_streak = streak;
+      if (tipo === 'taf_run') {
+        updates.treinos_concluidos = (Number(oldScore.treinos_concluidos) || 0) + 1;
+        updates.distancia_total_metros =
+          (Number(oldScore.distancia_total_metros) || 0) + distanciaMetros;
+        updates.progresso_fisico = {
+          ...(oldScore.progresso_fisico || {}),
+          ultima_corrida_metros: distanciaMetros,
+        };
+      } else if (tipo === 'taf_exercise') {
+        updates.treinos_concluidos = (Number(oldScore.treinos_concluidos) || 0) + 1;
+        updates.progresso_fisico = {
+          ...(oldScore.progresso_fisico || {}),
+          [exercicioMetric]: exercicioValor,
+        };
+      }
+
+      transaction.create(eventRef, {
+        uid,
+        tipo,
+        pontos,
+        dia: hoje,
+        criado_em: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      transaction.set(privateRef, updates, { merge: true });
+      awarded = true;
+
+      if (userData.participar_ranking === true) {
+        const mergedScore = { ...oldScore, ...updates };
+        const shareProgress = userData.compartilhar_progresso_fisico === true;
+        const entry = {
+          uid,
+          participar_ranking: true,
+          nome_guerra: textoPublico(userData.nomeGuerra, 'Combatente', 40),
+          posto_graduacao: textoPublico(userData.postoGraduacao, 'Não informado', 60),
+          om: textoPublico(userData.om, '', 100),
+          cidade_estado: textoPublico(userData.cidadeEstado, '', 100),
+          photo_url: /^https:\/\//i.test(userData.photo_url || '')
+            ? userData.photo_url.slice(0, 500)
+            : '',
+          score: nextScore,
+          dias_streak: Number(mergedScore.dias_streak) || 0,
+          compartilhar_progresso_fisico: shareProgress,
+          atualizado_em: admin.firestore.FieldValue.serverTimestamp(),
+        };
+        if (shareProgress) {
+          entry.progresso_fisico = {
+            treinos_concluidos: Number(mergedScore.treinos_concluidos) || 0,
+            distancia_total_metros: Number(mergedScore.distancia_total_metros) || 0,
+            ...(mergedScore.progresso_fisico || {}),
+          };
+        }
+        transaction.set(rankingPublicRef(uid), entry);
+      }
+    });
+    return res.status(200).json({ awarded, points: awarded ? pontos : 0 });
+  } catch (error) {
+    console.error('Falha ao registrar atividade no ranking:', error.message);
+    return res.status(503).json({ error: 'Não foi possível atualizar sua pontuação.' });
+  }
+});
+
+app.get('/ranking/global', async (req, res) => {
+  const decoded = await verificarTokenFirebase(req);
+  if (!decoded) return res.status(401).json({ error: 'Sessão inválida.' });
+  if (decoded.firebase?.sign_in_provider === 'anonymous') {
+    return res.status(403).json({ error: 'Entre em uma conta para consultar o ranking.' });
+  }
+
+  try {
+    const uid = decoded.uid;
+    const filter = ['geral', 'om', 'posto'].includes(req.query.filter)
+      ? req.query.filter
+      : 'geral';
+    const [userSnapshot, scoreSnapshot] = await Promise.all([
+      db.collection('usuarios').doc(uid).get(),
+      rankingPrivateRef(uid).get(),
+    ]);
+    const userData = userSnapshot.data() || {};
+    const ownEntry = await dadosPublicosDoRanking(
+      uid,
+      userData,
+      scoreSnapshot.data() || { score: 0 },
+    );
+    if (!ownEntry) {
+      return res.status(200).json({
+        participates: false,
+        entries: [],
+        current_user: null,
+        current_position: null,
+        total_participants: 0,
+        filter_value: null,
+      });
+    }
+
+    let query = db.collection('ranking_global').where('participar_ranking', '==', true);
+    const filterValue = filter === 'om'
+      ? textoPublico(userData.om, '', 100)
+      : filter === 'posto'
+        ? textoPublico(userData.postoGraduacao, '', 60)
+        : '';
+    if (filter === 'om' && filterValue) query = query.where('om', '==', filterValue);
+    if (filter === 'posto' && filterValue) {
+      query = query.where('posto_graduacao', '==', filterValue);
+    }
+
+    if (filter !== 'geral' && !filterValue) {
+      return res.status(200).json({
+        participates: true,
+        entries: [],
+        current_user: ownEntry,
+        current_position: null,
+        total_participants: 0,
+        filter_value: null,
+      });
+    }
+
+    const topSnapshot = await query.orderBy('score', 'desc').limit(50).get();
+    let totalParticipants = topSnapshot.size;
+    let currentPosition = null;
+    try {
+      const totalSnapshot = await query.count().get();
+      totalParticipants = totalSnapshot.data().count;
+      const aheadSnapshot = await query.where('score', '>', ownEntry.score).count().get();
+      currentPosition = aheadSnapshot.data().count + 1;
+    } catch (error) {
+      // Mantém o Top 50 quando a instância Firestore não oferece agregações.
+      console.warn('Contagem agregada indisponível no ranking:', error.message);
+    }
+
+    return res.status(200).json({
+      participates: true,
+      entries: topSnapshot.docs.map((document) => document.data()),
+      current_user: ownEntry,
+      current_position: currentPosition,
+      total_participants: totalParticipants,
+      filter_value: filterValue || null,
+    });
+  } catch (error) {
+    console.error('Falha ao carregar ranking:', error.message);
+    return res.status(503).json({ error: 'Ranking temporariamente indisponível.' });
+  }
+});
+
+
+// ---------------------------------------------------------------------
+// BATALHA NAVAL ONLINE — salas privadas com jogadas validadas no servidor.
+// As frotas ficam em subdocumentos que nunca são enviados ao adversário.
+// ---------------------------------------------------------------------
+const NAVAL_ROOMS = 'jogos_batalha_naval';
+const NAVAL_CODE_ALPHABET = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
+const NAVAL_FLEET = [
+  { id: 0, name: 'Porta-aviões', size: 5 },
+  { id: 1, name: 'Encouraçado', size: 4 },
+  { id: 2, name: 'Cruzador', size: 3 },
+  { id: 3, name: 'Submarino', size: 3 },
+  { id: 4, name: 'Contratorpedeiro', size: 2 },
+];
+
+function novoCodigoNaval() {
+  return Array.from({ length: 6 }, () =>
+    NAVAL_CODE_ALPHABET[crypto.randomInt(NAVAL_CODE_ALPHABET.length)]).join('');
+}
+
+function criarFrotaNaval() {
+  const occupied = new Set();
+  return NAVAL_FLEET.map((ship) => {
+    for (let attempt = 0; attempt < 1000; attempt++) {
+      const horizontal = crypto.randomInt(2) === 0;
+      const row = crypto.randomInt(horizontal ? 10 : 11 - ship.size);
+      const col = crypto.randomInt(horizontal ? 11 - ship.size : 10);
+      const cells = Array.from({ length: ship.size }, (_, index) => [
+        row + (horizontal ? 0 : index),
+        col + (horizontal ? index : 0),
+      ]);
+      if (cells.some(([r, c]) => occupied.has(`${r}:${c}`))) continue;
+      cells.forEach(([r, c]) => occupied.add(`${r}:${c}`));
+      return { ...ship, cells };
+    }
+    throw new Error('Não foi possível posicionar a frota.');
+  });
+}
+
+function codigoNaval(value) {
+  return typeof value === 'string' ? value.trim().toUpperCase() : '';
+}
+
+async function nomePublicoNaval(uid, tokenName) {
+  const profile = await db.collection('usuarios').doc(uid).get();
+  const name = profile.data()?.nomeGuerra || tokenName || 'Combatente';
+  return String(name).trim().slice(0, 40) || 'Combatente';
+}
+
+async function jogadorDaSala(req, res) {
+  const decoded = await verificarTokenFirebase(req);
+  if (!decoded) {
+    res.status(401).json({ error: 'Sessão Firebase inválida.' });
+    return null;
+  }
+  return decoded;
+}
+
+app.post('/jogos/batalha-naval/criar', async (req, res) => {
+  const decoded = await jogadorDaSala(req, res);
+  if (!decoded) return;
+  try {
+    const uid = decoded.uid;
+    const name = await nomePublicoNaval(uid, decoded.name);
+    const fleet = criarFrotaNaval();
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const code = novoCodigoNaval();
+      const roomRef = db.collection(NAVAL_ROOMS).doc(code);
+      let collision = false;
+      await db.runTransaction(async (tx) => {
+        const existing = await tx.get(roomRef);
+        if (existing.exists) {
+          collision = true;
+          return;
+        }
+        tx.create(roomRef, {
+          code,
+          game: 'batalha_naval',
+          status: 'waiting',
+          hostUid: uid,
+          playerUids: [uid],
+          players: [{ uid, name }],
+          turnUid: null,
+          winnerUid: null,
+          shots: [],
+          lastAction: null,
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          expiresAt: admin.firestore.Timestamp.fromDate(
+            new Date(Date.now() + 24 * 60 * 60 * 1000),
+          ),
+        });
+        tx.create(roomRef.collection('private').doc(uid), { fleet });
+      });
+      if (!collision) {
+        return res.status(201).json({ code, fleet, status: 'waiting' });
+      }
+    }
+    return res.status(503).json({ error: 'Não foi possível abrir a sala. Tente novamente.' });
+  } catch (error) {
+    console.error('Falha ao criar sala naval:', error.message);
+    return res.status(503).json({ error: 'Não foi possível criar a sala agora.' });
+  }
+});
+
+app.post('/jogos/batalha-naval/entrar', async (req, res) => {
+  const decoded = await jogadorDaSala(req, res);
+  if (!decoded) return;
+  const code = codigoNaval(req.body?.code);
+  if (!/^[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{6}$/.test(code)) {
+    return res.status(400).json({ error: 'Informe um código de sala válido.' });
+  }
+  try {
+    const uid = decoded.uid;
+    const name = await nomePublicoNaval(uid, decoded.name);
+    const fleet = criarFrotaNaval();
+    const roomRef = db.collection(NAVAL_ROOMS).doc(code);
+    const outcome = await db.runTransaction(async (tx) => {
+      const roomSnapshot = await tx.get(roomRef);
+      if (!roomSnapshot.exists) return { error: 'Sala não encontrada.', status: 404 };
+      const room = roomSnapshot.data();
+      if (room.expiresAt?.toDate && room.expiresAt.toDate() < new Date()) {
+        return { error: 'Esta sala expirou. Crie uma nova sala.', status: 410 };
+      }
+      if (room.playerUids.includes(uid)) {
+        const ownPrivate = await tx.get(roomRef.collection('private').doc(uid));
+        return { room, fleet: ownPrivate.data()?.fleet || [], status: 200 };
+      }
+      if (room.status !== 'waiting' || room.playerUids.length !== 1) {
+        return { error: 'A sala já está cheia ou a partida já começou.', status: 409 };
+      }
+      if (room.hostUid === uid) {
+        return { error: 'O criador da sala precisa entrar com outra conta/dispositivo.', status: 409 };
+      }
+      const players = [...room.players, { uid, name }];
+      tx.create(roomRef.collection('private').doc(uid), { fleet });
+      tx.update(roomRef, {
+        playerUids: [...room.playerUids, uid],
+        players,
+        status: 'battle',
+        turnUid: room.hostUid,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      return { room: { ...room, playerUids: [...room.playerUids, uid], players, status: 'battle', turnUid: room.hostUid }, fleet, status: 200 };
+    });
+    if (outcome.error) return res.status(outcome.status).json({ error: outcome.error });
+    return res.status(200).json({ code, room: outcome.room, fleet: outcome.fleet });
+  } catch (error) {
+    console.error('Falha ao entrar na sala naval:', error.message);
+    return res.status(503).json({ error: 'Não foi possível entrar na sala agora.' });
+  }
+});
+
+app.get('/jogos/batalha-naval/:code/estado', async (req, res) => {
+  const decoded = await jogadorDaSala(req, res);
+  if (!decoded) return;
+  const code = codigoNaval(req.params.code);
+  try {
+    const roomRef = db.collection(NAVAL_ROOMS).doc(code);
+    const [roomSnapshot, privateSnapshot] = await Promise.all([
+      roomRef.get(),
+      roomRef.collection('private').doc(decoded.uid).get(),
+    ]);
+    if (!roomSnapshot.exists || !roomSnapshot.data().playerUids.includes(decoded.uid)) {
+      return res.status(404).json({ error: 'Sala não encontrada para este jogador.' });
+    }
+    return res.status(200).json({
+      code,
+      room: { ...roomSnapshot.data(), id: roomSnapshot.id },
+      fleet: privateSnapshot.data()?.fleet || [],
+    });
+  } catch (error) {
+    console.error('Falha ao consultar sala naval:', error.message);
+    return res.status(503).json({ error: 'Não foi possível carregar a sala.' });
+  }
+});
+
+app.post('/jogos/batalha-naval/:code/tiro', async (req, res) => {
+  const decoded = await jogadorDaSala(req, res);
+  if (!decoded) return;
+  const code = codigoNaval(req.params.code);
+  const row = Number(req.body?.row);
+  const col = Number(req.body?.col);
+  const actionId = typeof req.body?.actionId === 'string'
+    ? req.body.actionId.slice(0, 80)
+    : crypto.randomUUID();
+  if (!/^[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{6}$/.test(code) ||
+      !Number.isInteger(row) || !Number.isInteger(col) ||
+      row < 0 || row > 9 || col < 0 || col > 9) {
+    return res.status(400).json({ error: 'Coordenada de tiro inválida.' });
+  }
+  try {
+    const uid = decoded.uid;
+    const roomRef = db.collection(NAVAL_ROOMS).doc(code);
+    const result = await db.runTransaction(async (tx) => {
+      const roomSnapshot = await tx.get(roomRef);
+      if (!roomSnapshot.exists) return { error: 'Sala não encontrada.', status: 404 };
+      const room = roomSnapshot.data();
+      if (!room.playerUids.includes(uid) || room.playerUids.length !== 2) {
+        return { error: 'Você não participa desta partida.', status: 403 };
+      }
+      if (room.status !== 'battle') {
+        return { error: 'A partida não está em andamento.', status: 409 };
+      }
+      if (room.turnUid !== uid) return { error: 'Aguarde a sua vez.', status: 409 };
+      if (room.shots.some((shot) => shot.actionId === actionId)) {
+        return { room, duplicate: true };
+      }
+      const targetUid = room.playerUids.find((playerUid) => playerUid !== uid);
+      if (room.shots.some((shot) =>
+        shot.attackerUid === uid && shot.row === row && shot.col === col)) {
+        return { error: 'Você já disparou nesta coordenada.', status: 409 };
+      }
+      const privateRef = roomRef.collection('private').doc(targetUid);
+      const privateSnapshot = await tx.get(privateRef);
+      const fleet = privateSnapshot.data()?.fleet || [];
+      const ship = fleet.find((item) => item.cells.some((cell) => cell[0] === row && cell[1] === col));
+      const shots = [...room.shots];
+      const action = {
+        actionId,
+        attackerUid: uid,
+        targetUid,
+        row,
+        col,
+        hit: Boolean(ship),
+        sunkShip: null,
+        createdAt: admin.firestore.Timestamp.now(),
+      };
+      shots.push(action);
+      const hits = new Set(shots
+        .filter((shot) => shot.targetUid === targetUid && shot.hit)
+        .map((shot) => `${shot.row}:${shot.col}`));
+      if (ship && ship.cells.every((cell) => hits.has(`${cell[0]}:${cell[1]}`))) {
+        action.sunkShip = ship.name;
+      }
+      const victory = fleet.every((item) =>
+        item.cells.every((cell) => hits.has(`${cell[0]}:${cell[1]}`)));
+      const status = victory ? 'finished' : 'battle';
+      const updated = {
+        shots,
+        lastAction: action,
+        status,
+        turnUid: victory ? null : targetUid,
+        winnerUid: victory ? uid : null,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      };
+      tx.update(roomRef, updated);
+      return { room: { ...room, ...updated }, duplicate: false };
+    });
+    if (result.error) return res.status(result.status).json({ error: result.error });
+    return res.status(200).json({ duplicate: result.duplicate, room: result.room });
+  } catch (error) {
+    console.error('Falha ao registrar tiro naval:', error.message);
+    return res.status(503).json({ error: 'Não foi possível registrar o disparo.' });
+  }
+});
+
+app.get('/jogos/batalha-naval/:code/eventos', async (req, res) => {
+  const decoded = await jogadorDaSala(req, res);
+  if (!decoded) return;
+  const code = codigoNaval(req.params.code);
+  const roomRef = db.collection(NAVAL_ROOMS).doc(code);
+  try {
+    const initial = await roomRef.get();
+    if (!initial.exists || !initial.data().playerUids.includes(decoded.uid)) {
+      return res.status(404).json({ error: 'Sala não encontrada para este jogador.' });
+    }
+    res.status(200);
+    res.set({
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache, no-transform',
+      Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    });
+    if (typeof res.flushHeaders === 'function') res.flushHeaders();
+    const sendRoom = (snapshot) => {
+      if (!snapshot.exists || !snapshot.data().playerUids.includes(decoded.uid)) {
+        res.write(`event: room-error\ndata: ${JSON.stringify({ error: 'Acesso à sala encerrado.' })}\n\n`);
+        return;
+      }
+      res.write(`data: ${JSON.stringify({ room: { ...snapshot.data(), id: snapshot.id } })}\n\n`);
+    };
+    sendRoom(initial);
+    const unsubscribe = roomRef.onSnapshot(sendRoom, (error) => {
+      console.error('Erro no stream da sala naval:', error.message);
+      if (!res.writableEnded) res.end();
+    });
+    const heartbeat = setInterval(() => res.write(': ping\n\n'), 25000);
+    res.on('close', () => {
+      clearInterval(heartbeat);
+      unsubscribe();
+    });
+  } catch (error) {
+    console.error('Falha ao abrir stream naval:', error.message);
+    if (!res.headersSent) return res.status(503).json({ error: 'Não foi possível acompanhar a sala.' });
+    return res.end();
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Servidor rodando na porta ${PORT}`));
