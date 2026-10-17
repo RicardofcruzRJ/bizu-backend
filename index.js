@@ -25,9 +25,20 @@ const WEBHOOK_URL = process.env.WEBHOOK_URL;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 const CONTRACT_VERSION = '1.0';
+const ADMIN_EMAIL = 'ricardofcruzrj@gmail.com';
+const PRECO_REF = () => db.collection('configuracoes').doc('precos');
+const PRECOS_PADRAO = Object.freeze({
+  mensal_valor: 9.90,
+  trimestral_valor: 19.80,
+  ia_avulsa_valor: 5.90,
+  mensal_plano_id: 'elite_mensal',
+  trimestral_plano_id: 'elite_trimestral',
+  ia_avulsa_plano_id: 'ia_avulso',
+});
 const PRODUTOS_ASSINATURA = Object.freeze({
   elite_mensal: {
     preco: 9.90,
+    campoPreco: 'mensal_valor',
     dias: 30,
     isElite: true,
     descricao: 'BiZu MáXimo - Área Elite (30 dias)',
@@ -35,13 +46,15 @@ const PRODUTOS_ASSINATURA = Object.freeze({
   },
   elite_trimestral: {
     preco: 19.80,
+    campoPreco: 'trimestral_valor',
     dias: 90,
     isElite: true,
     descricao: 'BiZu MáXimo - Área Elite (90 dias)',
     campoExpiracao: 'elite_expiry_date',
   },
   ia_avulso: {
-    preco: 4.90,
+    preco: 5.90,
+    campoPreco: 'ia_avulsa_valor',
     dias: 30,
     isElite: false,
     descricao: 'BiZu MáXimo - Pacote IA Tática (30 dias)',
@@ -271,6 +284,71 @@ app.get('/assinatura/status', async (req, res) => {
   }
 });
 
+// Os preços são públicos para exibição, mas alterações passam exclusivamente
+// por esta rota autenticada e validada para a conta administrativa.
+app.get('/assinatura/precos', async (_req, res) => {
+  try {
+    const ref = PRECO_REF();
+    let snapshot = await ref.get();
+    if (!snapshot.exists) {
+      await ref.set({
+        ...PRECOS_PADRAO,
+        atualizadoEm: admin.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true });
+      snapshot = await ref.get();
+    }
+    const configurados = snapshot.data() || {};
+    const prices = {};
+    for (const field of Object.keys(PRECOS_PADRAO)) {
+      const value = configurados[field];
+      prices[field] = field.endsWith('_valor') &&
+          typeof value === 'number' && Number.isFinite(value) && value > 0 && value <= 9999
+        ? Number(value.toFixed(2))
+        : PRECOS_PADRAO[field];
+    }
+    return res.status(200).json({
+      prices,
+    });
+  } catch (error) {
+    console.error('Erro ao carregar preços de assinatura:', error.message);
+    return res.status(500).json({ error: 'Não foi possível carregar os preços.' });
+  }
+});
+
+app.put('/admin/assinatura/precos', async (req, res) => {
+  const decoded = await verificarTokenFirebase(req);
+  if (!decoded || decoded.email?.toLowerCase() !== ADMIN_EMAIL) {
+    return res.status(403).json({ error: 'Apenas o administrador pode alterar os preços.' });
+  }
+
+  const body = req.body || {};
+  const fields = ['mensal_valor', 'trimestral_valor', 'ia_avulsa_valor'];
+  const prices = {};
+  for (const field of fields) {
+    const value = body[field];
+    if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0 || value > 9999) {
+      return res.status(400).json({ error: 'Informe valores entre R$ 0,01 e R$ 9.999,00.' });
+    }
+    prices[field] = Number(value.toFixed(2));
+  }
+
+  try {
+    const saved = {
+      ...prices,
+      mensal_plano_id: 'elite_mensal',
+      trimestral_plano_id: 'elite_trimestral',
+      ia_avulsa_plano_id: 'ia_avulso',
+      atualizadoEm: admin.firestore.FieldValue.serverTimestamp(),
+      atualizadoPor: decoded.uid,
+    };
+    await PRECO_REF().set(saved, { merge: true });
+    return res.status(200).json({ prices: { ...PRECOS_PADRAO, ...prices } });
+  } catch (error) {
+    console.error('Erro ao salvar preços de assinatura:', error.message);
+    return res.status(500).json({ error: 'Não foi possível salvar os preços.' });
+  }
+});
+
 // ---------------------------------------------------------------------
 // 1. CRIAÇÃO DO PIX
 // ---------------------------------------------------------------------
@@ -298,6 +376,13 @@ app.post('/gerar-pix', async (req, res) => {
       return res.status(500).json({ error: 'Pagamentos indisponíveis no momento.' });
     }
 
+    const priceSnapshot = await PRECO_REF().get();
+    const configuredPrice = priceSnapshot.data()?.[produto.campoPreco];
+    const transactionAmount = typeof configuredPrice === 'number' &&
+        Number.isFinite(configuredPrice) && configuredPrice > 0 && configuredPrice <= 9999
+      ? Number(configuredPrice.toFixed(2))
+      : produto.preco;
+
     // Registra o aceite com horário do servidor antes de solicitar a cobrança.
     const stateRef = assinaturaRef(userId);
     await db.runTransaction(async (tx) => {
@@ -323,7 +408,7 @@ app.post('/gerar-pix', async (req, res) => {
         'X-Idempotency-Key': crypto.randomUUID(),
       },
       body: JSON.stringify({
-        transaction_amount: produto.preco,
+        transaction_amount: transactionAmount,
         payment_method_id: 'pix',
         description: produto.descricao,
         payer: { email },
@@ -332,6 +417,7 @@ app.post('/gerar-pix', async (req, res) => {
           user_id: userId,
           product_id: productId,
           contract_version: CONTRACT_VERSION,
+          transaction_amount: transactionAmount,
         },
         ...(WEBHOOK_URL ? { notification_url: WEBHOOK_URL } : {}),
       }),
